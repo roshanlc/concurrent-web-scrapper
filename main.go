@@ -1,9 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"os"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/imroc/req/v3"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const baseURL = "https://books.toscrape.com/index.html"
@@ -37,24 +40,31 @@ type result struct {
 	upc          string
 }
 
+type Save struct {
+	Title    string `bson:"title,omitempty"`
+	Url      string `bson:"url,omitempty"`
+	Category string `bson:"category,omitempty"`
+	Price    string `bson:"price,omitempty"`
+	Summary  string `bson:"summary,omitempty"`
+}
+
+func (r result) String() string {
+	return fmt.Sprintf("Title: %s, Url: %s, Category: %s\nimageURL: %s, Price: %s, Rating: %v\nInStock: %s, stockAmount: %s\nSummary: %s\n",
+		r.title, r.url, r.category, r.imageURL, r.price, r.rating, r.isInStock, r.stockAmount, r.summary)
+}
+
 // worker creates a new worker
-func worker(wg sync.WaitGroup, jobs chan job, termination chan bool) {
+func worker(wg *sync.WaitGroup, jobs chan job, results chan result) {
 
 	defer wg.Done()
 
 	// client to send request
 	httpClient := newHttpClient()
 
-	for {
-		select {
-		case unit, _ := <-jobs:
-			//start working
-			output := extractFromDetailsPage(httpClient, unit)
-			fmt.Println(output)
-		case <-termination:
-			fmt.Println("Shutting down")
-			return
-		}
+	for work := range jobs {
+		log.Println("Processing individual page: ", work.url)
+		output := extractFromDetailsPage(httpClient, work)
+		results <- output
 	}
 }
 
@@ -71,10 +81,15 @@ func newHttpClient() *req.Client {
 }
 
 func main() {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Println("Suffered a panic.")
+			fmt.Println(err)
+		}
+	}()
 
 	// get a new client and a request
 	client := newHttpClient()
-	fmt.Println("Addr:", &client)
 	req := client.R()
 
 	log.Println("Trying to send get request: ", baseURL)
@@ -106,13 +121,96 @@ func main() {
 		}
 	})
 
-	if len(categories) > 0 {
-		scrapeCategory(categories[0].text, categories[0].url)
+	// fail early
+	if len(categories) == 0 {
+		log.Println("Zero catefories were extracted. Shutting down.")
+		return
+	}
+
+	allJobs := make(chan job, 200) // buffered chanel
+	allResults := make(chan result, 200)
+
+	var wgResult sync.WaitGroup
+	var wgCat sync.WaitGroup
+	var wgJobs sync.WaitGroup
+
+	for _, cat := range categories {
+		wgCat.Add(1)
+		go scrapeCategory(&wgCat, allJobs, cat.text, cat.url)
+	}
+
+	// only spawn 25 go-routines as workers
+	for i := 0; i < 25; i++ {
+		wgJobs.Add(1)
+		go worker(&wgJobs, allJobs, allResults)
+	}
+
+	wgResult.Add(1)
+	// go routine to save results
+	go saveResult(&wgResult, allResults)
+
+	wgCat.Wait()
+	close(allJobs)
+	wgJobs.Wait()
+	close(allResults)
+	// wait for all goroutine to end
+	wgResult.Wait()
+
+	log.Println("Scrapping completed...")
+}
+
+// save result coming from
+func saveResult(wg *sync.WaitGroup, data chan result) {
+
+	defer wg.Done()
+	count := 0
+
+	// fileName := "results.txt"
+	// file, err := os.Open(fileName)
+
+	// if err != nil {
+	// 	log.Fatal("Unable to open file to save")
+	// }
+
+	// defer file.Close()
+
+	// for val := range data {
+	// 	fmt.Println("Writing result..")
+	// 	file.WriteString(fmt.Sprintf("%s,%s,%s,%v,%s\n", val.title, val.category, val.url, val.price, val.price))
+	// }
+
+	clientOptions := options.Client().ApplyURI("mongodb://admin:password@localhost:27017/")
+
+	client, err := mongo.Connect(context.TODO(), clientOptions)
+	if err != nil {
+		panic(err)
+	}
+
+	year, month, day := time.Now().Date()
+	m := time.Now().Minute()
+	collectionName := fmt.Sprintf("scrape-%d-%d-%d-%d", year, month, day, m)
+	scrape := client.Database("scrape").Collection(collectionName)
+
+	defer client.Disconnect(context.TODO())
+	for val := range data {
+
+		_, err = scrape.InsertOne(context.Background(), Save{Title: val.title, Url: val.url, Category: val.category, Price: val.price, Summary: val.summary})
+
+		if err != nil {
+			log.Println(err)
+		} else {
+			count++
+			log.Println("Total rows added: ", count)
+		}
 	}
 
 }
 
-func scrapeCategory(text, url string) {
+// scrape a category of books
+func scrapeCategory(wg *sync.WaitGroup, jobs chan job, text, url string) {
+	defer wg.Done()
+
+	backupURL := url
 	// create a new http client for each function execution
 	// will be useful in concurrent execution
 	httpClient := newHttpClient()
@@ -152,7 +250,7 @@ func scrapeCategory(text, url string) {
 		return
 	}
 
-	fmt.Println("Total count:", totalCount)
+	log.Println("Total count:", totalCount, " for category:", text)
 
 	re = regexp.MustCompile(`(?i)Page \d+ of (\d+)`)
 	totalPages := strings.TrimSpace(page.Find("li.current").Text())
@@ -161,7 +259,7 @@ func scrapeCategory(text, url string) {
 	currentPage := 1
 
 	if totalPages == "" {
-		fmt.Println("No further pages found for category:", text)
+		log.Println("No further pages found for category:", text)
 	} else {
 
 		match = re.FindStringSubmatch(totalPages)
@@ -174,7 +272,7 @@ func scrapeCategory(text, url string) {
 				return
 			}
 
-			fmt.Printf("Total pages for category: %s is %d\n", text, count)
+			log.Printf("Total pages for category: %s is %d\n", text, count)
 		}
 	}
 
@@ -184,16 +282,41 @@ func scrapeCategory(text, url string) {
 		if currentPage > 1 {
 
 			// make request for next page
+			temp := strings.ReplaceAll(backupURL, "index.html", "")
+			url = fmt.Sprintf("%spage-%d.html", temp, currentPage)
+
+			ok := validateURL(url)
+			// validate the url first
+			if !ok {
+				currentPage++
+				continue
+			}
+			log.Println("Trying to send get request:", url)
+
+			pageResp, err := req.Get(url)
+			if err != nil {
+				log.Println(err)
+				currentPage++
+				continue
+			}
+
+			page, err = goquery.NewDocumentFromReader(pageResp.Body)
+
+			if err != nil {
+				log.Println(err)
+				currentPage++
+				continue
+			}
 		}
 
 		books := extractFromListingPage(page)
 
 		for key, val := range books {
 			temp := job{category: text, title: key, url: val}
-			fmt.Println(extractFromDetailsPage(httpClient, temp))
-			os.Exit(1) // TODO: remove this later
+			jobs <- temp
 
 		}
+
 		currentPage++
 	}
 }
@@ -234,16 +357,24 @@ func extractFromDetailsPage(httpClient *req.Client, unit job) result {
 	if err != nil {
 		log.Fatal(err)
 	}
+	r.imageURL = page.Find("img").First().AttrOr("src", "")
 
-	// image url
-	r.imageURL = page.Find("div.item.active > img").AttrOr("src", "")
+	r.summary = strings.TrimSpace(page.Find("div#product_description + p").Text())
 
 	// price
-	r.price = strings.TrimSpace(page.Find("p.price_color").Text())
+	r.price = strings.TrimSpace(page.Find("p.price_color").First().Text())
 
-	// TODO: stock availabilit, units available, rating
-
-	r.summary = strings.TrimSpace(page.Find("div#product_description + p").First().Text())
+	// TODO: stock availabilit, units available, rating and others
 
 	return r
+}
+
+func validateURL(link string) bool {
+	_, err := url.ParseRequestURI(link)
+	if err != nil {
+		log.Println(err)
+		return false
+	}
+
+	return true
 }
